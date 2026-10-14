@@ -1,0 +1,96 @@
+# lipsync.py: measure Jun Jun's mouth from the real voice, for the parts where she sings or speaks to camera, and
+# write src/lipsync.js.
+#
+# The transcript word times are too loose for lip-sync (off by up to 0.35 s, early and late), so this separates the
+# voice from the music (demucs) and follows its syllables. Run from the project root:
+#   uv run --python 3.11 --with demucs --with soundfile --with librosa --with scipy --with "torch==2.5.1" --with "torchaudio==2.5.1" tools/lipsync.py
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import librosa
+import numpy as np
+from scipy.signal import find_peaks
+
+ROOT = Path(__file__).resolve().parent.parent
+AUDIO = ROOT / "assets" / "operation-walkies.mp3"
+TMP = ROOT / "out" / "tmp" / "lip"
+OUT = ROOT / "src" / "lipsync.js"
+RATE = 48                                # samples per second (2 per video frame)
+
+# Each part: the song range to analyse (s) and the phrases of the lead voice inside it.
+# The voice stem also carries the choir and bleed from the snare, and both look like syllables, so the phrases were
+# fixed by hand: list the onsets of the voice stem and of the drum stem (printed below), drop the ones the drums
+# explain, and match what is left to the syllables of each lyric line.
+PARTS = [
+    # bridge: Sometimes… | We make it back | without fire. | Sometimes… | the street is battlefield. |
+    #   But every mission… | every walk… | Is a step | closer to glory. | I love the smell (chorus pickup)
+    ("bridge", 100.0, 136.0, [(102.25, 103.25), (106.75, 108.40), (110.15, 111.45), (113.12, 114.05), (116.95, 118.98),
+                              (120.90, 121.98), (123.35, 124.10), (126.00, 126.95), (127.92, 129.95), (134.18, 135.95)]),
+    # radio report, first shot only (she faces the camera): Alfa Akita
+    ("radio", 151.0, 158.5, [(153.42, 154.95)]),
+]
+TMP.mkdir(parents=True, exist_ok=True)
+
+sr = 24000
+hop = sr // RATE
+
+def stem(path):
+    y, _ = librosa.load(path, sr=sr, mono=False)
+    return np.abs((librosa.stft(y[0], n_fft=1024, hop_length=hop) + librosa.stft(y[1], n_fft=1024, hop_length=hop)) / 2) ** 2
+
+# Articulation: speech changes its spectrum at every syllable; a held choir note does not.
+def articulation(P):
+    mel = librosa.feature.melspectrogram(S=P, sr=sr, n_mels=40, fmin=200, fmax=5000)
+    lm = np.log1p(50 * mel / mel.max())
+    fl = np.maximum(0, np.diff(lm, axis=1, prepend=lm[:, :1])).sum(axis=0)
+    fl = np.convolve(fl, np.ones(3) / 3, mode="same")
+    return np.clip(fl / np.percentile(fl, 97), 0, 1)
+
+lips = []
+for part, T0, T1, LEAD in PARTS:
+    seg = TMP / f"{part}.wav"
+    voc = TMP / "sep4" / "htdemucs" / part / "vocals.wav"
+    drm = voc.with_name("drums.wav")
+    if not voc.exists():
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(T0), "-t", str(T1 - T0), "-i", str(AUDIO), "-ar", "44100", "-ac", "2", str(seg)], check=True)
+        subprocess.run([sys.executable, "-m", "demucs", "-d", "cpu", "-n", "htdemucs", "-o", str(TMP / "sep4"), str(seg)], check=True)
+    P = stem(voc)
+    n = min(P.shape[1], int((T1 - T0) * RATE))
+    P = P[:, :n]
+    fv, fd = articulation(P)[:n], articulation(stem(drm))[:n]
+
+    tt = T0 + np.arange(n) / RATE
+    gate = np.zeros(n)
+    for a, b in LEAD:
+        gate = np.maximum(gate, np.clip((tt - a) / .05, 0, 1) * np.clip((b - tt) / .09, 0, 1))
+
+    # each syllable opens the mouth fast and lets it fall back; inside a phrase it never quite shuts
+    f = np.clip((fv - .16) / .84, 0, 1)
+    pulse = np.zeros(n); k = np.exp(-1 / (.11 * RATE)); acc = 0.0
+    for i in range(n):
+        acc = max(f[i] ** .7, acc * k); pulse[i] = acc
+    v = np.clip(np.maximum(pulse, .3), 0, 1) * gate
+    v = np.convolve(v, np.ones(2) / 2, mode="same")
+
+    # roundness: little energy above 1 kHz against the band below = a round vowel ("oh", "oo"). Kept gentle: the choir
+    # colours it.
+    fr = librosa.fft_frequencies(sr=sr, n_fft=1024)
+    ratio = np.log((P[(fr > 1000) & (fr < 3000)].sum(axis=0) + 1e-9) / (P[(fr > 200) & (fr < 900)].sum(axis=0) + 1e-9))
+    p20, p80 = np.percentile(ratio[v > .2], [20, 80])
+    r = .65 * (1 - np.clip((ratio - p20) / (p80 - p20), 0, 1))
+    r = np.convolve(r, np.ones(7) / 7, mode="same")
+
+    # evidence for the LEAD list: onsets of the voice stem and of the drum stem
+    for name, fl in (("voice", fv), ("drums", fd)):
+        pk, _ = find_peaks(fl, height=.3, distance=6, prominence=.15)
+        print(part, name, "onsets:", " ".join(f"{T0 + i / RATE:.2f}" for i in pk if T0 + 1 <= T0 + i / RATE < T1))
+    # the result as a picture: one digit per 1/8 s, 0 = shut, 9 = wide open
+    for a in range(int(T0), int(T1), 2):
+        print(f"{a:4d}: " + "".join(str(min(9, int(np.max(v[int((a - T0 + q * .125) * RATE):int((a - T0 + q * .125) * RATE) + 6], initial=0) * 9.99))) for q in range(16)))
+
+    lips.append({"t0": T0, "rate": RATE, "v": [round(float(x), 2) for x in v], "r": [round(float(x), 2) for x in r]})
+
+OUT.write_text("// Generated by tools/lipsync.py from the separated voice. Do not edit by hand.\nconst LIP = " + json.dumps(lips, separators=(",", ":")) + ";\n")
+print("wrote", OUT, [len(l["v"]) for l in lips], "samples")
