@@ -1,6 +1,8 @@
 # Princess Jun Jun — "Operation Walkies"
 
-![Operation Walkies — starring Princess JunJun](docs/poster.jpg)
+[![Operation Walkies — starring Princess JunJun](docs/poster.jpg)](https://www.youtube.com/watch?v=qZUAuDjw7VI)
+
+**▶ [Watch the film on YouTube](https://www.youtube.com/watch?v=qZUAuDjw7VI)**
 
 A hand-drawn animated music video, drawn in code with p5.js and p5.brush and rendered frame by frame in headless
 Chrome. It looks like an underground anime concert poster starring one extremely judgmental Akita.
